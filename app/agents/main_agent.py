@@ -1,27 +1,87 @@
-# updated_main_agent.py
+# main_agent.py
 """
-Updated AI Web Agent — Chrome-only with local LLM loader helper.
+Main agent for InfoScout — Google-only, DB-integrated, with optional reranker & image-cacher hooks.
 
-Improvements:
-- More robust Playwright extraction for search results (wait for selectors, multiple fallbacks)
-- HTTP fallback prefers BeautifulSoup if available, else regex
-- DuckDuckGo fallback if Google fails or blocks
-- load_local_mistral_model tries `llama_cpp` if available and otherwise marks file-present
-- TaskResult is always serializable (.to_dict)
-- Automatic saving to TaskMemory on execute
-- Defensive waits and clear steps_taken logging
+Key behaviors:
+- Robust imports for app.db.db_helpers, app.llm.reranker, app.utils.image_cache (with top-level fallbacks)
+- Uses absolute DB paths under db_dir: searches.db, results.db, memory.db
+- After persisting results to DB, will optionally call reranker and image cache hooks (if available)
 """
-
 import asyncio
 import json
+import re
 import sqlite3
-import sys
-import time
-from dataclasses import dataclass, asdict
-from datetime import datetime
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urljoin
 
+# -------------------------
+# resilient db_helpers import
+# -------------------------
+_DB_HELPERS_AVAILABLE = False
+try:
+    from app.db.db_helpers import (
+        init_all_dbs,
+        create_search,
+        bulk_insert_results,
+        mark_search_completed,
+        save_memory,
+        dedup_key_from_link,
+    )
+    print("ℹ️ Imported db_helpers from app.db.db_helpers", flush=True)
+    _DB_HELPERS_AVAILABLE = True
+except Exception as e_primary:
+    try:
+        from app.db.db_helpers import (
+            init_all_dbs,
+            create_search,
+            bulk_insert_results,
+            mark_search_completed,
+            save_memory,
+            dedup_key_from_link,
+        )
+        print("ℹ️ Imported db_helpers from db_helpers.py (top-level)", flush=True)
+        _DB_HELPERS_AVAILABLE = True
+    except Exception as e_fallback:
+        print("⚠️ db_helpers import failed (both app.db.db_helpers and db_helpers.py).", flush=True)
+        print("   primary import error:", repr(e_primary), flush=True)
+        print("   fallback import error:", repr(e_fallback), flush=True)
+        _DB_HELPERS_AVAILABLE = False
+
+# -------------------------
+# optional reranker & image_cache imports (resilient)
+# -------------------------
+_RERANKER_AVAILABLE = False
+_IMAGE_CACHE_AVAILABLE = False
+try:
+    from app.llm.reranker import rerank_search
+    _RERANKER_AVAILABLE = True
+    print("ℹ️ Imported rerank_search from app.llm.reranker", flush=True)
+except Exception as e:
+    try:
+        from llm.reranker import rerank_search
+        _RERANKER_AVAILABLE = True
+        print("ℹ️ Imported rerank_search from llm.reranker (top-level)", flush=True)
+    except Exception as e2:
+        print("⚠️ reranker import failed (app.llm.reranker / llm.reranker).", flush=True)
+
+try:
+    from app.utils.image_cache import cache_images_for_search
+    _IMAGE_CACHE_AVAILABLE = True
+    print("ℹ️ Imported cache_images_for_search from app.utils.image_cache", flush=True)
+except Exception as e:
+    try:
+        from utils.image_cache import cache_images_for_search
+        _IMAGE_CACHE_AVAILABLE = True
+        print("ℹ️ Imported cache_images_for_search from utils.image_cache (top-level)", flush=True)
+    except Exception as e2:
+        print("⚠️ image_cache import failed (app.utils.image_cache / utils.image_cache).", flush=True)
+
+# -------------------------
+# optional Playwright & BeautifulSoup
+# -------------------------
 try:
     from playwright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
@@ -29,7 +89,6 @@ except Exception:
     async_playwright = None
     _PLAYWRIGHT_AVAILABLE = False
 
-# try optional deps
 try:
     from bs4 import BeautifulSoup
     _BS4_AVAILABLE = True
@@ -38,7 +97,7 @@ except Exception:
     _BS4_AVAILABLE = False
 
 # -------------------------
-# dataclasses & memory
+# dataclasses & TaskMemory
 # -------------------------
 @dataclass
 class TaskStep:
@@ -50,7 +109,7 @@ class TaskStep:
     result: Any = None
 
 class TaskMemory:
-    def __init__(self, db_path: str = "task_memory.db"):
+    def __init__(self, db_path: str):
         self.db_path = db_path
         self.init_db()
 
@@ -76,7 +135,6 @@ class TaskMemory:
                            (instruction, json.dumps(result, ensure_ascii=False), json.dumps(steps_taken or [])))
             conn.commit(); conn.close()
         except Exception:
-            # don't fail the agent if DB write fails
             print("⚠️ TaskMemory.save_task failed", flush=True)
 
     def get_recent_tasks(self, limit: int = 10) -> List[Dict]:
@@ -121,36 +179,117 @@ class SimpleMistralParser:
         self.loader_repr: Optional[str] = None
 
 # -------------------------
+# Helpers
+# -------------------------
+def extract_domain(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc.lower()
+    except Exception:
+        return None
+
+def normalize_url(url: Optional[str], base_scheme: str = "https") -> Optional[str]:
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith("//"):
+        return f"{base_scheme}:{url}"
+    if re.match(r"^[\w-]+\.[\w\.-]+", url) and not url.startswith("http"):
+        return "https://" + url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return None
+
+def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
+    try:
+        import requests
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        norm = normalize_url(url)
+        if not norm:
+            steps_log.append(f"[image-fetch] cannot normalize url: {url}")
+            return None
+        resp = requests.get(norm, headers=headers, timeout=6)
+        html = resp.text or ""
+        if _BS4_AVAILABLE:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                og = soup.find("meta", property="og:image")
+                if og and og.get("content"):
+                    val = og.get("content")
+                    return normalize_url(val) or urljoin(norm, val)
+                tw = soup.find("meta", attrs={"name": "twitter:image"})
+                if tw and tw.get("content"):
+                    val = tw.get("content")
+                    return normalize_url(val) or urljoin(norm, val)
+                icon = soup.find("link", rel=lambda x: x and "icon" in x.lower())
+                if icon and icon.get("href"):
+                    href = icon.get("href")
+                    return urljoin(norm, href)
+            except Exception as e:
+                steps_log.append(f"[image-fetch] bs4 parse error: {repr(e)}")
+        parsed = urlparse(norm)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+    except Exception as e:
+        steps_log.append(f"[image-fetch] request failed: {repr(e)}")
+    return None
+
+# -------------------------
 # EnhancedWebAgent
 # -------------------------
 class EnhancedWebAgent:
-    def __init__(self, headless: bool = True):
-        self.memory = TaskMemory()
+    def __init__(self, headless: bool = True, db_dir: str = ".", auto_rerank: bool = False, auto_image_cache: bool = False, reranker_model_path: Optional[str] = None):
+        # canonicalize db_dir
+        self.db_dir = Path(db_dir).resolve()
+        self.db_dir.mkdir(parents=True, exist_ok=True)
+
+        # initialize DBs with helper if available
+        if _DB_HELPERS_AVAILABLE:
+            try:
+                init_all_dbs(str(self.db_dir))
+                print(f"ℹ️ DBs initialized in {self.db_dir}", flush=True)
+            except Exception as e:
+                print("⚠️ init_all_dbs failed:", e, flush=True)
+
+        # absolute DB paths
+        self.searches_db = str(self.db_dir / "searches.db")
+        self.results_db = str(self.db_dir / "results.db")
+        self.memory_db = str(self.db_dir / "memory.db")
+
+        # ensure TaskMemory uses same memory_db
+        self.memory = TaskMemory(db_path=self.memory_db)
+
+        # Playwright state
         self.page = None
         self.context = None
         self._playwright = None
         self.headless = headless
 
-        # model attrs
-        self.model_path: Optional[str] = None
-        self.model_loaded: bool = False
+        # model / reranker config
         self.mistral_parser = SimpleMistralParser()
+        self.reranker_model_path = reranker_model_path
+        self.auto_rerank = bool(auto_rerank) and _RERANKER_AVAILABLE
+        self.auto_image_cache = bool(auto_image_cache) and _IMAGE_CACHE_AVAILABLE
 
-        # persistent profile dir for Playwright
+        # Playwright profile dir
         self.user_data_dir = Path(".playwright_profile").resolve()
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
-        print(f"🤖 EnhancedWebAgent initialized (headless={self.headless}). Mistral loader present: True", flush=True)
 
-    # -------------------------
-    # lifecycle: start / stop
-    # -------------------------
+        print(f"🤖 EnhancedWebAgent initialized (headless={self.headless}). DB dir={self.db_dir}", flush=True)
+        if auto_rerank and not _RERANKER_AVAILABLE:
+            print("⚠️ auto_rerank requested but reranker not available (import failed).", flush=True)
+        if auto_image_cache and not _IMAGE_CACHE_AVAILABLE:
+            print("⚠️ auto_image_cache requested but image_cache not available (import failed).", flush=True)
+
+    # lifecycle
     async def start(self):
         if not _PLAYWRIGHT_AVAILABLE:
             print("❌ Playwright not installed; browser automation disabled.", flush=True)
             return
         try:
             self._playwright = await async_playwright().start()
-            # prefer system chrome, fallback to chromium
             try:
                 self.context = await self._playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.user_data_dir),
@@ -167,18 +306,14 @@ class EnhancedWebAgent:
                     args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
                 )
             pages = self.context.pages
-            if pages:
-                self.page = pages[0]
-            else:
-                self.page = await self.context.new_page()
+            self.page = pages[0] if pages else await self.context.new_page()
             print("✅ Launched Chrome/Chromium via Playwright.", flush=True)
         except NotImplementedError:
-            print("⚠️ Playwright NotImplementedError: subprocess support not available in this loop.", flush=True)
+            print("⚠️ Playwright NotImplementedError (loop/subprocess).", flush=True)
         except Exception as e:
             print("⚠️ Playwright start error:", e, flush=True)
 
     async def stop(self):
-        # close page/context/playwright in reverse order; ignore exceptions
         try:
             if self.page:
                 await self.page.close()
@@ -194,7 +329,6 @@ class EnhancedWebAgent:
                 await self._playwright.stop()
         except Exception:
             pass
-        # release any model-backed object if it provides close
         try:
             if getattr(self.mistral_parser, "model_obj", None):
                 obj = self.mistral_parser.model_obj
@@ -204,89 +338,60 @@ class EnhancedWebAgent:
         except Exception:
             pass
 
-    # -------------------------
-    # Local model loader helper
-    # -------------------------
+    # optional local model loader (unchanged)
     def load_local_mistral_model(self, path: str, force_mark_if_exists: bool = True) -> bool:
         p = Path(path)
         resolved = str(p.resolve()) if p.exists() else None
-        self.model_path = resolved
         self.mistral_parser.model_path = resolved
-
-        # try to import llama_cpp
         try:
             from llama_cpp import Llama
             if p.exists():
                 try:
-                    # instantiate Llama (may be heavy). Adjust kwargs for your machine.
                     llama = Llama(model_path=str(p))
                     self.mistral_parser.model_obj = llama
                     self.mistral_parser.model_loaded = True
                     self.mistral_parser.model_name = getattr(llama, "__repr__", lambda: "llama_model")()
                     self.mistral_parser.loader_repr = repr(llama)[:1000]
-                    self.model_loaded = True
-                    print(f"✅ Loaded local model via llama_cpp at: {self.model_path}", flush=True)
+                    print(f"✅ Loaded local model via llama_cpp at: {resolved}", flush=True)
                     return True
                 except Exception as e:
                     print(f"⚠️ llama_cpp failed to load model at {p}: {e}", flush=True)
-                    # fall through to file-exists marking
         except Exception:
-            # llama_cpp not installed — we'll still mark file presence if allowed
             pass
-
         if p.exists() and force_mark_if_exists:
             self.mistral_parser.model_loaded = True
             self.mistral_parser.model_name = p.name
             self.mistral_parser.loader_repr = "<file present, loader not bound>"
-            self.model_loaded = True
-            self.mistral_parser.model_path = str(p.resolve())
-            print(f"ℹ️ Model file exists at {self.model_path}. Marked as present (llama_cpp not used).", flush=True)
+            print(f"ℹ️ Model file exists at {resolved}. Marked as present.", flush=True)
             return True
-
         self.mistral_parser.model_loaded = False
-        self.model_loaded = False
         print("⚠️ No local model loaded.", flush=True)
         return False
 
-    # -------------------------
-    # Search helpers
-    # -------------------------
+    # Playwright extraction for Google SERP (unchanged)
     async def _extract_with_playwright_google(self, url: str, search_term: str, steps_log: List[str]) -> Optional[List[Dict]]:
-        """
-        Attempt robust extraction from Google SERP using Playwright.
-        Returns a list of results or None if extraction yielded nothing.
-        """
         try:
-            # navigate and wait for relevant selectors
             await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            # small wait for dynamic content / scripts
             await asyncio.sleep(1.0)
-
-            # Try multiple selector strategies to be robust
             selectors = [
-                "a h3",                 # generic: anchor contains h3
-                "div.g h3",             # google result block h3
-                "div.yuRUbf > a",       # older Google structure
+                "a h3",
+                "div.g h3",
+                "div.yuRUbf > a",
                 "div[data-sokoban-container] a h3"
             ]
             results = []
             rank = 1
-            # Try waiting for any of common selectors
             found_any = False
             for sel in selectors:
                 try:
-                    # wait a bit (non-fatal)
                     await self.page.wait_for_selector(sel, timeout=2000)
                     found_any = True
-                    # select all anchors that contain h3 or are result anchors
                     anchors = await self.page.query_selector_all(sel)
                     for el in anchors:
                         try:
-                            # If selector matched h3, climb to parent anchor
                             tag = await el.get_property("tagName")
                             tagname = (await tag.json_value()).lower() if tag else ""
                             if tagname == "h3":
-                                # parent anchor likely contains href; climb up
                                 parent = await el.evaluate_handle("node => node.closest('a')")
                                 if parent:
                                     href = await parent.get_property("href")
@@ -294,19 +399,13 @@ class EnhancedWebAgent:
                                 else:
                                     href_val = None
                                 title = (await el.inner_text()).strip() if await el.inner_text() else ""
-                                snippet_el = await (await parent.get_property("parentNode")).as_element() if parent else None
-                                snippet = ""
                             else:
-                                # element is anchor-like; attempt to extract h3/text and href
                                 href_val = await el.get_attribute("href")
-                                # text may be h3 inside
                                 title_el = await el.query_selector("h3")
                                 title = (await title_el.inner_text()).strip() if title_el else (await el.inner_text()).strip()
-                                snippet = ""
-                            # normalize link
-                            link = href_val if href_val and isinstance(href_val, str) else None
+                            link = normalize_url(href_val) or href_val
                             if title and link and link.startswith("http"):
-                                results.append({"rank": rank, "title": title, "link": link, "snippet": snippet, "source": "google"})
+                                results.append({"rank": rank, "title": title, "link": link, "snippet": "", "source": "google"})
                                 rank += 1
                                 if rank > 10:
                                     break
@@ -316,10 +415,7 @@ class EnhancedWebAgent:
                         steps_log.append(f"[chrome] Extracted {len(results)} results from Google (Playwright).")
                         return results
                 except Exception:
-                    # try next selector
                     continue
-
-            # if we reached here and didn't find results
             if not found_any:
                 steps_log.append("[chrome] No common selectors found on Google SERP.")
             else:
@@ -329,14 +425,13 @@ class EnhancedWebAgent:
             steps_log.append(f"[playwright] goto/error: {repr(e)}")
             return None
 
+    # HTTP fallbacks (unchanged)
     def _http_extract_google_bs4(self, html: str, steps_log: List[str]) -> List[Dict]:
-        """Extract Google results using BeautifulSoup (preferred)."""
         results = []
         if not _BS4_AVAILABLE:
             return results
         try:
             soup = BeautifulSoup(html, "html.parser")
-            # Google content frequently has h3 inside anchors
             anchors = soup.select("a h3")
             rank = 1
             seen = set()
@@ -346,10 +441,11 @@ class EnhancedWebAgent:
                     continue
                 link = a.get("href")
                 title = h3.get_text(strip=True)
-                if link and title and link.startswith("http"):
-                    if link in seen: continue
-                    seen.add(link)
-                    results.append({"rank": rank, "title": title, "link": link, "snippet": "", "source": "google-http"})
+                link_norm = normalize_url(link) or link
+                if link_norm and title and link_norm.startswith("http"):
+                    if link_norm in seen: continue
+                    seen.add(link_norm)
+                    results.append({"rank": rank, "title": title, "link": link_norm, "snippet": "", "source": "google-http"})
                     rank += 1
                     if rank > 10:
                         break
@@ -359,66 +455,29 @@ class EnhancedWebAgent:
             return []
 
     def _http_extract_google_regex(self, html: str, steps_log: List[str]) -> List[Dict]:
-        """Fallback regex extraction on Google SERP (less reliable)."""
         results = []
         try:
-            import re, urllib.parse as up
+            import urllib.parse as up
             anchors = re.findall(r'<a href="(/url\?q=https?://[^"&]+)', html)
             seen = set()
             rank = 1
             for a in anchors:
                 if rank > 10: break
                 qpart = up.unquote(a)
-                # remove prefix /url?q=
                 if qpart.startswith("/url?q="):
                     qpart = qpart[len("/url?q="):]
-                # extract until & or "
                 link = qpart.split("&")[0]
-                if link not in seen:
-                    seen.add(link)
-                    results.append({"rank": rank, "title": None, "link": link, "snippet": "", "source": "google-http"})
+                link_norm = normalize_url(link) or link
+                if link_norm not in seen:
+                    seen.add(link_norm)
+                    results.append({"rank": rank, "title": None, "link": link_norm, "snippet": "", "source": "google-http"})
                     rank += 1
             return results
         except Exception as e:
             steps_log.append(f"[http-regex] extraction error: {repr(e)}")
             return []
 
-    def _http_extract_duckduckgo(self, html: str, steps_log: List[str]) -> List[Dict]:
-        """Try DuckDuckGo HTML SERP parsing (if we hit ddg)."""
-        results = []
-        try:
-            if _BS4_AVAILABLE:
-                soup = BeautifulSoup(html, "html.parser")
-                items = soup.select("a.result__a")
-                rank = 1
-                for a in items:
-                    link = a.get("href")
-                    title = a.get_text(strip=True)
-                    if link and title:
-                        results.append({"rank": rank, "title": title, "link": link, "snippet": "", "source": "duckduckgo"})
-                        rank += 1
-                        if rank > 10: break
-            else:
-                # regex fallback for ddg
-                import re
-                matches = re.findall(r'<a class="result__a" href="([^"]+)"', html)
-                rank = 1
-                for m in matches:
-                    if rank > 10: break
-                    results.append({"rank": rank, "title": None, "link": m, "snippet": "", "source": "duckduckgo"})
-                    rank += 1
-            return results
-        except Exception as e:
-            steps_log.append(f"[http-ddg] parse error: {repr(e)}")
-            return []
-
     async def _http_fetch_and_extract(self, url: str, steps_log: List[str]) -> Optional[List[Dict]]:
-        """
-        Make HTTP GET and attempt extraction:
-        - prefer bs4 extraction on Google SERP
-        - fallback to regex if needed
-        - if Google returns nothing, try DuckDuckGo
-        """
         try:
             import requests
             headers = {
@@ -427,30 +486,16 @@ class EnhancedWebAgent:
             }
             resp = requests.get(url, headers=headers, timeout=15)
             html = resp.text or ""
-            # Try bs4 google extractor
             res = []
             if _BS4_AVAILABLE:
                 res = self._http_extract_google_bs4(html, steps_log)
             if res:
                 steps_log.append(f"[http] Extracted {len(res)} results via HTTP Google (bs4).")
                 return res
-            # regex fallback
             res = self._http_extract_google_regex(html, steps_log)
             if res:
                 steps_log.append(f"[http] Extracted {len(res)} results via HTTP Google (regex).")
                 return res
-            # try duckduckgo as alternative
-            ddg_url = url.replace("www.google.com/search", "duckduckgo.com/html").replace("q=", "q=")
-            try:
-                resp2 = requests.get(ddg_url, headers=headers, timeout=12)
-                html2 = resp2.text or ""
-                res2 = self._http_extract_duckduckgo(html2, steps_log)
-                if res2:
-                    steps_log.append(f"[http] Extracted {len(res2)} results via DuckDuckGo fallback.")
-                    return res2
-            except Exception as e:
-                steps_log.append(f"[http] DuckDuckGo fetch error: {repr(e)}")
-            # nothing
             return None
         except Exception as e:
             steps_log.append(f"[fallback] HTTP fetch failed: {repr(e)}")
@@ -463,67 +508,135 @@ class EnhancedWebAgent:
             return TaskResult(success=False, data=None, error_message="No search term provided", steps_taken=[])
 
         steps_log: List[str] = [f"🔎 Start search for: {search_term}"]
-        # create Google URL with safe params
         import urllib.parse as up
         q = up.quote_plus(search_term)
         url = f"https://www.google.com/search?q={q}&num=10&hl=en&pws=0"
 
+        # create search record (use absolute path)
+        search_id = None
+        if _DB_HELPERS_AVAILABLE:
+            try:
+                search_id = create_search(self.searches_db, search_term, num_results=10, backend="google")
+                steps_log.append(f"[db] Created search_id={search_id} (db={self.searches_db})")
+                print(f"✅ create_search -> id={search_id} saved to {self.searches_db}", flush=True)
+            except Exception as e:
+                steps_log.append(f"[db] create_search failed: {repr(e)}")
+                print("⚠️ create_search threw:", repr(e), flush=True)
+        else:
+            steps_log.append("[db] db_helpers not available; skipping DB writes.")
+            print("⚠️ db_helpers not available; skipping DB writes.", flush=True)
+
+        results = None
         # Playwright path
         if self.page is not None:
             try:
                 results = await self._extract_with_playwright_google(url, search_term, steps_log)
                 if results:
-                    # save & return
-                    payload = {"search_term": search_term, "results": results}
-                    self.memory.save_task(search_term, payload, steps_taken=steps_log)
-                    return TaskResult(success=True, data=payload, steps_taken=steps_log)
+                    steps_log.append(f"[flow] Playwright returned {len(results)} results.")
                 else:
                     steps_log.append("[chrome] No results extracted from Playwright DOM; falling back to HTTP fetch.")
             except Exception as e:
                 steps_log.append(f"[playwright] extraction exception: {repr(e)}")
 
-        # HTTP fallback
-        http_res = await self._http_fetch_and_extract(url, steps_log)
-        if http_res:
-            payload = {"search_term": search_term, "results": http_res}
-            self.memory.save_task(search_term, payload, steps_taken=steps_log)
-            return TaskResult(success=True, data=payload, steps_taken=steps_log)
+        # HTTP fallback (Google only)
+        if not results:
+            http_res = await self._http_fetch_and_extract(url, steps_log)
+            if http_res:
+                results = http_res
+                steps_log.append(f"[flow] HTTP fetch returned {len(results)} results.")
 
-        # Last resort: try DuckDuckGo direct (in case Google blocks)
-        try:
-            ddg_q = up.quote_plus(search_term)
-            ddg_url = f"https://duckduckgo.com/html?q={ddg_q}"
-            ddg_res = await self._http_fetch_and_extract(ddg_url, steps_log)
-            if ddg_res:
-                payload = {"search_term": search_term, "results": ddg_res}
-                self.memory.save_task(search_term, payload, steps_taken=steps_log)
-                return TaskResult(success=True, data=payload, steps_taken=steps_log)
-        except Exception as e:
-            steps_log.append(f"[fallback] DuckDuckGo attempt failed: {repr(e)}")
+        # If we have results, enrich and save
+        if results:
+            for r in results:
+                link = r.get("link")
+                r["link"] = normalize_url(link) or link
+                r["domain"] = extract_domain(r["link"])
+                try:
+                    img = _fetch_og_or_favicon(r["link"], steps_log) if r["link"] else None
+                except Exception as e:
+                    steps_log.append(f"[image-fetch] error for {r.get('link')}: {repr(e)}")
+                    img = None
+                r["image"] = img
+                r.setdefault("score", 0.0)
+                r.setdefault("relevance", 0.0)
+                r.setdefault("clickability", 0.0)
+                r.setdefault("trust", 0.0)
+                r["extra"] = r.get("extra", {})
+
+            # persist TaskMemory
+            try:
+                self.memory.save_task(search_term, {"search_term": search_term, "results": results}, steps_taken=steps_log)
+            except Exception:
+                pass
+
+            # persist to results DB (use absolute paths)
+            if _DB_HELPERS_AVAILABLE and search_id is not None:
+                try:
+                    bulk_insert_results(self.results_db, search_id, results)
+                    mark_search_completed(self.searches_db, search_id)
+                    try:
+                        save_memory(self.memory_db, search_id, search_term, steps_log, summary=None)
+                    except Exception as e:
+                        steps_log.append(f"[db] save_memory failed: {repr(e)}")
+                except Exception as e:
+                    steps_log.append(f"[db] bulk_insert_results/mark_search_completed failed: {repr(e)}")
+
+            # POST-PROCESS: rerank & image-cache (if available and enabled)
+            # run reranker (best-effort)
+            if self.auto_rerank:
+                try:
+                    # call reranker.rerank_search(results_db, searches_db, search_id, model_path)
+                    model_path = self.reranker_model_path
+                    # rerank_search expects (results_db, searches_db, search_id, model_path=..., batch=...)
+                    print(f"[post] auto_rerank enabled; invoking reranker for search_id={search_id}", flush=True)
+                    rerank_search(self.results_db, self.searches_db, search_id, model_path=model_path)
+                    steps_log.append("[post] reranker invoked")
+                except Exception as e:
+                    steps_log.append(f"[post] reranker failed: {repr(e)}")
+                    print("[post] reranker failed:", traceback.format_exc(), flush=True)
+
+            # run image cache (best-effort)
+            if self.auto_image_cache:
+                try:
+                    print(f"[post] auto_image_cache enabled; invoking image_cache for search_id={search_id}", flush=True)
+                    # cache_images_for_search(db_dir, search_id, max_workers=6)
+                    cache_images_for_search(str(self.db_dir), search_id, max_workers=6)
+                    steps_log.append("[post] image_cache invoked")
+                except Exception as e:
+                    steps_log.append(f"[post] image_cache failed: {repr(e)}")
+                    print("[post] image_cache failed:", traceback.format_exc(), flush=True)
+
+            payload = {"search_term": search_term, "results": results, "search_id": search_id}
+            return TaskResult(success=True, data=payload, steps_taken=steps_log)
 
         # final failure
         steps_log.append("[fallback] All attempts (Playwright + HTTP) failed or returned no results")
-        self.memory.save_task(search_term, None, steps_taken=steps_log)
+        try:
+            self.memory.save_task(search_term, None, steps_taken=steps_log)
+        except Exception:
+            pass
+        if _DB_HELPERS_AVAILABLE and search_id is not None:
+            try:
+                mark_search_completed(self.searches_db, search_id)
+                save_memory(self.memory_db, search_id, search_term, steps_log, summary=None)
+            except Exception:
+                pass
         return TaskResult(success=False, data=None, error_message="All attempts (Playwright + HTTP) failed or returned no results", steps_taken=steps_log)
 
     async def execute_instruction(self, instruction: str) -> TaskResult:
-        """
-        Public entrypoint that orchestrates the instruction into steps.
-        For now we support a single-step 'search' workflow.
-        """
         step = TaskStep(step_id=1, description=f"Search for {instruction}", action="search",
                         parameters={"search_term": instruction})
         result = await self._execute_search_step(step)
-        # ensure result.steps_taken is list
         if result.steps_taken is None:
             result.steps_taken = []
         return result
 
-# If executed directly, provide a simple interactive CLI for debugging
+# CLI runner
 async def main():
-    agent = EnhancedWebAgent(headless=False)
-    # optionally auto-load local model here; change path as needed
-    # agent.load_local_mistral_model(r"D:\YASH\model\mistral-7b-openorca.gguf2.Q4_0.gguf")
+    # set auto_rerank and auto_image_cache to True if you want post-processing
+    agent = EnhancedWebAgent(headless=True, db_dir=".", auto_rerank=False, auto_image_cache=False, reranker_model_path=None)
+    # optionally load a local model:
+    # agent.load_local_mistral_model("model/mistral-7b-openorca.gguf2.Q4_0.gguf")
     await agent.start()
     try:
         while True:

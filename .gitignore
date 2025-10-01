@@ -1,2 +1,9 @@
 model/
 .venv/
+.playwright_profile/
+results.db
+searches.db 
+task_memory.db
+memory.db
+__pycache__/
+app/__pycache__/
