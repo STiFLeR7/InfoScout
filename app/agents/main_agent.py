@@ -605,7 +605,7 @@ class EnhancedWebAgent:
             return {"results": results, "summary": None, "steps": steps}
 
         try:
-            # Try: await rerank_search(results, model=model_obj, ...)
+            # Try: rerank_search(results, model=model_obj, max_tokens=128, use_model_for_summary=True, query=query)
             try:
                 maybe = rerank_search(results, model=model_obj, max_tokens=128, use_model_for_summary=True, query=query)
                 if asyncio.iscoroutine(maybe):
@@ -617,19 +617,19 @@ class EnhancedWebAgent:
             except TypeError as e1:
                 steps.append(f"[reranker] signature try-1 failed: {repr(e1)}")
 
-            # Try: await rerank_search(results, model_obj, max_tokens=...)
+            # Try: rerank_search(model_obj, query, results, max_model_calls=4)
             try:
-                maybe = rerank_search(results, model_obj, 128, True, query)
+                maybe = rerank_search(model_obj, query, results, 4)
                 if asyncio.iscoroutine(maybe):
                     out = await maybe
                 else:
                     out = maybe
-                steps.append("[reranker] used signature: rerank_search(results, model_obj, 128, True, query)")
+                steps.append("[reranker] used signature: rerank_search(model_obj, query, results, max_model_calls)")
                 return {**{"steps": steps}, **(out or {})}
             except TypeError as e2:
                 steps.append(f"[reranker] signature try-2 failed: {repr(e2)}")
 
-            # Try: await rerank_search(results) (model-less)
+            # Try: rerank_search(results) (model-less)
             try:
                 maybe = rerank_search(results)
                 if asyncio.iscoroutine(maybe):
@@ -793,7 +793,7 @@ class EnhancedWebAgent:
 async def main():
     agent = EnhancedWebAgent(headless=True, db_dir=".")
     # uncomment to load model quietly:
-    # agent.load_local_mistral_model("model/mistral-7b-openorca.gguf2.Q4_0.gguf")
+    agent.load_local_mistral_model("model/mistral-7b-openorca.gguf2.Q4_0.gguf")
     await agent.start()
     try:
         while True:
