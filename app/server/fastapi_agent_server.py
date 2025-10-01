@@ -11,10 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Import your EnhancedWebAgent
-from updated_main_agent import EnhancedWebAgent
+from app.agents.main_agent import EnhancedWebAgent
 
 # --- Config ---
-MODEL_PATH = r"D:\YASH\model\mistral-7b-openorca.gguf2.Q4_0.gguf"
+MODEL_PATH = r"D:\InfoScout\model\mistral-7b-openorca.gguf2.Q4_0.gguf"
 
 app = FastAPI(title="AI Web Agent (FastAPI)", version="auto-load-model-1.0")
 

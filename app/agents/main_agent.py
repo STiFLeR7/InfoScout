@@ -1,14 +1,12 @@
 # app/agents/main_agent.py
 """
-InfoScout — main agent runner (full, updated).
+InfoScout — main agent runner (updated)
 
-Features:
-- Google-only (Playwright + HTTP fallback)
-- DBs: searches.db, results.db, memory.db under db_dir
-- Async-safe reranker integration (awaits rerank_search)
-- Quiet local model loader (loads model/*, suppresses verbose native logs)
-- Image enrichment (OG image / favicon)
-- Resilient imports for app.db.db_helpers, app.llm.reranker, app.utils.image_cache
+- Robust reranker invocation (tries multiple call styles, safely awaits coroutines)
+- Heuristic scoring fallback: fills score, relevance, clickability, trust
+- Google-only Playwright extraction + HTTP fallback
+- DB helpers resilient import
+- Quiet local model loader (suppresses noisy native logs during instantiate)
 """
 from __future__ import annotations
 
@@ -16,18 +14,14 @@ import asyncio
 import contextlib
 import io
 import json
-import os
 import re
 import sqlite3
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urljoin
 
-# -------------------------
-# resilient imports
-# -------------------------
+# ---------- resilient imports ----------
 _DB_HELPERS_AVAILABLE = False
 try:
     from app.db.db_helpers import (
@@ -43,7 +37,6 @@ try:
     _DB_HELPERS_AVAILABLE = True
 except Exception as e_primary:
     try:
-        # try top-level fallback (if running differently)
         from app.db.db_helpers import (
             init_all_dbs,
             create_search,
@@ -61,13 +54,15 @@ except Exception as e_primary:
         print("   fallback import error:", repr(e_fallback), flush=True)
         _DB_HELPERS_AVAILABLE = False
 
-# reranker (async)
+# reranker (async-capable)
 try:
     from app.llm.reranker import rerank_search
+
     print("ℹ️ Imported rerank_search from app.llm.reranker", flush=True)
 except Exception:
     try:
         from llm.reranker import rerank_search  # type: ignore
+
         print("ℹ️ Imported rerank_search from llm.reranker (fallback)", flush=True)
     except Exception:
         rerank_search = None
@@ -76,10 +71,12 @@ except Exception:
 # image cache helper (optional)
 try:
     from app.utils.image_cache import cache_images_for_search
+
     print("ℹ️ Imported cache_images_for_search from app.utils.image_cache", flush=True)
 except Exception:
     try:
         from utils.image_cache import cache_images_for_search  # type: ignore
+
         print("ℹ️ Imported cache_images_for_search from utils.image_cache (fallback)", flush=True)
     except Exception:
         cache_images_for_search = None
@@ -88,6 +85,7 @@ except Exception:
 # Playwright & BeautifulSoup optional
 try:
     from playwright.async_api import async_playwright
+
     _PLAYWRIGHT_AVAILABLE = True
 except Exception:
     async_playwright = None
@@ -95,14 +93,14 @@ except Exception:
 
 try:
     from bs4 import BeautifulSoup
+
     _BS4_AVAILABLE = True
 except Exception:
     BeautifulSoup = None
     _BS4_AVAILABLE = False
 
-# -------------------------
-# dataclasses & memory
-# -------------------------
+
+# ---------- dataclasses & memory ----------
 @dataclass
 class TaskStep:
     step_id: int
@@ -195,7 +193,7 @@ class SimpleMistralParser:
 
 
 # -------------------------
-# Helpers
+# Helpers: url normalization, domain, image fetch
 # -------------------------
 def extract_domain(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -248,7 +246,6 @@ def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
                     return urljoin(norm, href)
             except Exception as e:
                 steps_log.append(f"[image-fetch] bs4 parse error: {repr(e)}")
-        # fallback favicon guess
         parsed = urlparse(norm)
         if parsed.scheme and parsed.netloc:
             return f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
@@ -258,15 +255,85 @@ def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
 
 
 # -------------------------
+# Heuristic scorer (fallback)
+# -------------------------
+TRUSTY_DOMAINS = {
+    "nature.com": 0.9,
+    "arxiv.org": 0.85,
+    "ieeexplore.ieee.org": 0.9,
+    "springer.com": 0.8,
+    "acm.org": 0.85,
+    "gov": 0.9,
+    "edu": 0.8,
+    "github.com": 0.6,
+    "youtube.com": 0.5,
+    "wikipedia.org": 0.7,
+    "apple.com": 0.8,
+    "amazon.com": 0.5,
+    "flipkart.com": 0.45,
+}
+
+
+def _heuristic_trust(domain: Optional[str]) -> float:
+    if not domain:
+        return 0.3
+    d = domain.lower()
+    for key, val in TRUSTY_DOMAINS.items():
+        if key in d:
+            return float(val)
+    # heuristics: edu/gov TLD
+    if d.endswith(".edu") or d.endswith(".gov"):
+        return 0.85
+    # baseline
+    return 0.3
+
+
+def _heuristic_relevance(title: str, link: str, query: str) -> float:
+    # token overlap / simple measure
+    qtokens = [t for t in re.split(r"\W+", query.lower()) if t]
+    if not qtokens:
+        return 0.3
+    txt = (title + " " + (link or "")).lower()
+    matches = sum(1 for t in qtokens if t in txt)
+    return min(1.0, matches / max(1, len(qtokens))) * 0.9 + 0.05  # scale into 0.05..0.95
+
+
+def _heuristic_clickability(title: str, image: Optional[str]) -> float:
+    # images and short engaging titles => more clicky
+    base = 0.45
+    if image:
+        base += 0.25
+    # punch up shorter titles slightly
+    if title and len(title) < 60:
+        base += 0.05
+    return min(0.95, base)
+
+
+def apply_heuristic_scores(results: List[Dict], query: str):
+    for r in results:
+        title = r.get("title") or ""
+        link = r.get("link") or ""
+        domain = extract_domain(link)
+        img = r.get("image")
+        trust = _heuristic_trust(domain)
+        relevance = _heuristic_relevance(title, link, query)
+        clickability = _heuristic_clickability(title, img)
+        score = 0.5 * relevance + 0.3 * clickability + 0.2 * trust
+        # clamp and round a bit
+        r["trust"] = round(float(trust), 3)
+        r["relevance"] = round(float(relevance), 3)
+        r["clickability"] = round(float(clickability), 3)
+        r["score"] = round(float(max(0.0, min(1.0, score))), 4)
+
+
+# -------------------------
 # EnhancedWebAgent
 # -------------------------
 class EnhancedWebAgent:
     def __init__(self, headless: bool = True, db_dir: str = "."):
-        # canonicalize db_dir
         self.db_dir = Path(db_dir).resolve()
         self.db_dir.mkdir(parents=True, exist_ok=True)
 
-        # initialize DBs via helpers if available
         if _DB_HELPERS_AVAILABLE:
             try:
                 init_all_dbs(str(self.db_dir))
@@ -274,32 +341,27 @@ class EnhancedWebAgent:
             except Exception as e:
                 print("⚠️ init_all_dbs failed:", e, flush=True)
 
-        # db file paths
         self.searches_db = str(self.db_dir / "searches.db")
         self.results_db = str(self.db_dir / "results.db")
         self.memory_db = str(self.db_dir / "memory.db")
 
-        # memory
         self.memory = TaskMemory(db_path=self.memory_db)
 
-        # playwright
+        # Playwright / model
         self.page = None
         self.context = None
         self._playwright = None
         self.headless = headless
 
-        # model attrs
         self.model_path: Optional[str] = None
         self.model_loaded: bool = False
         self.mistral_parser = SimpleMistralParser()
 
-        # Playwright profile dir
         self.user_data_dir = Path(".playwright_profile").resolve()
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"🤖 EnhancedWebAgent initialized (headless={self.headless}). DB dir={self.db_dir}", flush=True)
 
-    # lifecycle
     async def start(self):
         if not _PLAYWRIGHT_AVAILABLE:
             print("❌ Playwright not installed; browser automation disabled.", flush=True)
@@ -345,7 +407,6 @@ class EnhancedWebAgent:
                 await self._playwright.stop()
         except Exception:
             pass
-        # release model if provided
         try:
             if getattr(self.mistral_parser, "model_obj", None):
                 obj = self.mistral_parser.model_obj
@@ -358,16 +419,11 @@ class EnhancedWebAgent:
             pass
 
     def load_local_mistral_model(self, path: str, force_mark_if_exists: bool = True) -> bool:
-        """
-        Quietly try to load local GGUF model via llama_cpp.Llama or mark as present.
-        Suppresses stdout/stderr during load to reduce noisy native logs.
-        """
         p = Path(path)
         resolved = str(p.resolve()) if p.exists() else None
         self.model_path = resolved
         self.mistral_parser.model_path = resolved
 
-        # helper to silence output
         devnull = io.StringIO()
         try:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
@@ -375,25 +431,19 @@ class EnhancedWebAgent:
                     from llama_cpp import Llama  # type: ignore
                 except Exception:
                     Llama = None
-            # outside silent context, try to instantiate if available
             if Llama is not None and p.exists():
-                try:
-                    # instantiate under silence again (native backend may print)
-                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                    try:
                         llama = Llama(model_path=str(p))
-                    self.mistral_parser.model_obj = llama
-                    self.mistral_parser.model_loaded = True
-                    self.mistral_parser.model_name = getattr(llama, "__repr__", lambda: "llama_model")()
-                    self.mistral_parser.loader_repr = repr(llama)[:1000]
-                    self.model_loaded = True
-                    # print minimal confirmation
-                    print(f"✅ Loaded local model via llama_cpp at: {self.model_path}", flush=True)
-                    print(f"✅ Local model loaded at: {Path(path).as_posix()}", flush=True)
-                    return True
-                except Exception as e:
-                    # swallow the noisy error but report a compact message
-                    print(f"⚠️ llama_cpp failed to load model at {p}: {e}", flush=True)
-            # mark presence if file exists
+                        self.mistral_parser.model_obj = llama
+                        self.mistral_parser.model_loaded = True
+                        self.mistral_parser.model_name = getattr(llama, "__repr__", lambda: "llama_model")()
+                        self.mistral_parser.loader_repr = repr(llama)[:1000]
+                        self.model_loaded = True
+                        print(f"✅ Loaded local model via llama_cpp at: {self.model_path}", flush=True)
+                        return True
+                    except Exception as e:
+                        print(f"⚠️ llama_cpp failed to load model at {p}: {e}", flush=True)
             if p.exists() and force_mark_if_exists:
                 self.mistral_parser.model_loaded = True
                 self.mistral_parser.model_name = p.name
@@ -410,7 +460,7 @@ class EnhancedWebAgent:
         print("⚠️ Local model not loaded; will fall back to heuristics.", flush=True)
         return False
 
-    # --- Playwright extraction for Google SERP ---
+    # Playwright extraction
     async def _extract_with_playwright_google(self, url: str, search_term: str, steps_log: List[str]) -> Optional[List[Dict]]:
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -462,7 +512,7 @@ class EnhancedWebAgent:
             steps_log.append(f"[playwright] goto/error: {repr(e)}")
             return None
 
-    # HTTP extraction fallbacks (Google only)
+    # HTTP fallbacks
     def _http_extract_google_bs4(self, html: str, steps_log: List[str]) -> List[Dict]:
         results = []
         if not _BS4_AVAILABLE:
@@ -542,6 +592,59 @@ class EnhancedWebAgent:
             steps_log.append(f"[fallback] HTTP fetch failed: {repr(e)}")
             return None
 
+    # Safely call reranker with multiple signature strategies
+    async def _call_reranker_safe(self, results: List[Dict], model_obj: Optional[Any], query: str) -> Dict[str, Any]:
+        """
+        Attempts multiple ways to call rerank_search and returns a dict:
+        { "results": [...], "summary": "...", "steps": [...] }
+        If no reranker available or it fails, returns empty dict.
+        """
+        steps: List[str] = []
+        if not rerank_search:
+            steps.append("[reranker] not installed")
+            return {"results": results, "summary": None, "steps": steps}
+
+        try:
+            # Try: await rerank_search(results, model=model_obj, ...)
+            try:
+                maybe = rerank_search(results, model=model_obj, max_tokens=128, use_model_for_summary=True, query=query)
+                if asyncio.iscoroutine(maybe):
+                    out = await maybe
+                else:
+                    out = maybe
+                steps.append("[reranker] used signature: rerank_search(results, model=..., max_tokens=..., use_model_for_summary=True, query=...)")
+                return {**{"steps": steps}, **(out or {})}
+            except TypeError as e1:
+                steps.append(f"[reranker] signature try-1 failed: {repr(e1)}")
+
+            # Try: await rerank_search(results, model_obj, max_tokens=...)
+            try:
+                maybe = rerank_search(results, model_obj, 128, True, query)
+                if asyncio.iscoroutine(maybe):
+                    out = await maybe
+                else:
+                    out = maybe
+                steps.append("[reranker] used signature: rerank_search(results, model_obj, 128, True, query)")
+                return {**{"steps": steps}, **(out or {})}
+            except TypeError as e2:
+                steps.append(f"[reranker] signature try-2 failed: {repr(e2)}")
+
+            # Try: await rerank_search(results) (model-less)
+            try:
+                maybe = rerank_search(results)
+                if asyncio.iscoroutine(maybe):
+                    out = await maybe
+                else:
+                    out = maybe
+                steps.append("[reranker] used signature: rerank_search(results)")
+                return {**{"steps": steps}, **(out or {})}
+            except Exception as e3:
+                steps.append(f"[reranker] final call failed: {repr(e3)}")
+        except Exception as e:
+            steps.append(f"[reranker] unexpected error: {repr(e)}")
+
+        return {"results": results, "summary": None, "steps": steps}
+
     # ----------- Search execution -----------
     async def _execute_search_step(self, step: TaskStep) -> TaskResult:
         search_term = step.parameters.get("search_term", "")
@@ -554,7 +657,7 @@ class EnhancedWebAgent:
         q = up.quote_plus(search_term)
         url = f"https://www.google.com/search?q={q}&num=10&hl=en&pws=0"
 
-        # create search record
+        # create DB search
         search_id = None
         if _DB_HELPERS_AVAILABLE:
             try:
@@ -581,80 +684,102 @@ class EnhancedWebAgent:
             except Exception as e:
                 steps_log.append(f"[playwright] extraction exception: {repr(e)}")
 
-        # HTTP fallback (Google only)
+        # HTTP fallback
         if not results:
             http_res = await self._http_fetch_and_extract(url, steps_log)
             if http_res:
                 results = http_res
                 steps_log.append(f"[flow] HTTP fetch returned {len(results)} results.")
 
-        # If we have results, enrich and save
-        if results:
-            for r in results:
-                link = r.get("link")
-                r["link"] = normalize_url(link) or link
-                r["domain"] = extract_domain(r["link"])
-                try:
-                    img = _fetch_og_or_favicon(r["link"], steps_log) if r["link"] else None
-                except Exception as e:
-                    steps_log.append(f"[image-fetch] error for {r.get('link')}: {repr(e)}")
-                    img = None
-                r["image"] = img
-                r.setdefault("score", 0.0)
-                r.setdefault("relevance", 0.0)
-                r.setdefault("clickability", 0.0)
-                r.setdefault("trust", 0.0)
-                r["extra"] = r.get("extra", {})
-
-            # run reranker (async) if available
-            summary = None
-            if rerank_search:
-                try:
-                    model_obj = getattr(self.mistral_parser, "model_obj", None)
-                    rerank_out = await rerank_search(results, model=model_obj, max_tokens=128, use_model_for_summary=True)
-                    # update results & summary
-                    results = rerank_out.get("results", results)
-                    summary = rerank_out.get("summary")
-                    steps_log.extend(rerank_out.get("steps", []))
-                except Exception as e:
-                    steps_log.append(f"[reranker] call failed: {repr(e)}")
-            else:
-                steps_log.append("[reranker] not available; skipping model rerank/summary")
-
-            # persist backward-compatible memory
+        if not results:
+            steps_log.append("[fallback] All attempts (Playwright + HTTP) failed or returned no results")
             try:
-                self.memory.save_task(search_term, {"search_term": search_term, "results": results, "summary": summary}, steps_taken=steps_log)
+                self.memory.save_task(search_term, None, steps_taken=steps_log)
             except Exception:
                 pass
-
-            # persist to DBs if helpers available
             if _DB_HELPERS_AVAILABLE and search_id is not None:
                 try:
-                    bulk_insert_results(self.results_db, search_id, results)
                     mark_search_completed(self.searches_db, search_id)
-                    try:
-                        save_memory(self.memory_db, search_id, search_term, steps_log, summary=summary)
-                    except Exception as e:
-                        steps_log.append(f"[db] save_memory failed: {repr(e)}")
-                except Exception as e:
-                    steps_log.append(f"[db] bulk_insert_results/mark_search_completed failed: {repr(e)}")
+                    save_memory(self.memory_db, search_id, search_term, steps_log, summary=None)
+                except Exception:
+                    pass
+            return TaskResult(success=False, data=None, error_message="No results", steps_taken=steps_log)
 
-            payload = {"search_term": search_term, "results": results, "summary": summary, "search_id": search_id}
-            return TaskResult(success=True, data=payload, steps_taken=steps_log)
+        # normalize + image fetch + default fields
+        for r in results:
+            link = r.get("link")
+            r["link"] = normalize_url(link) or link
+            r["domain"] = extract_domain(r["link"])
+            try:
+                img = _fetch_og_or_favicon(r["link"], steps_log) if r.get("link") else None
+            except Exception as e:
+                steps_log.append(f"[image-fetch] error for {r.get('link')}: {repr(e)}")
+                img = None
+            r["image"] = img or r.get("image")
+            r.setdefault("score", 0.0)
+            r.setdefault("relevance", 0.0)
+            r.setdefault("clickability", 0.0)
+            r.setdefault("trust", 0.0)
+            r["extra"] = r.get("extra", {})
 
-        # final failure
-        steps_log.append("[fallback] All attempts (Playwright + HTTP) failed or returned no results")
+        # call reranker safely
+        model_obj = getattr(self.mistral_parser, "model_obj", None)
+        rerank_out = await self._call_reranker_safe(results, model_obj, search_term)
+
+        # merge output if present
+        steps_from_rerank = rerank_out.get("steps", [])
+        steps_log.extend(steps_from_rerank)
+        maybe_results = rerank_out.get("results")
+        summary = rerank_out.get("summary")
+
+        if maybe_results:
+            # prefer model-provided fields, but ensure all items have numeric metrics
+            results = maybe_results
+
+        # Ensure each result has non-zero metrics; if everything is zero, apply heuristics
+        need_heuristic = True
+        for r in results:
+            # consider heuristic if all zero or missing
+            vals = [r.get("score", 0.0), r.get("relevance", 0.0), r.get("clickability", 0.0), r.get("trust", 0.0)]
+            if any(v and float(v) > 1e-6 for v in vals):
+                need_heuristic = False
+                break
+
+        if need_heuristic:
+            steps_log.append("[reranker-heuristic] applying heuristic scoring (no usable model scores)")
+            apply_heuristic_scores(results, search_term)
+        else:
+            # fill any missing metric per-result
+            for r in results:
+                if not r.get("relevance"):
+                    r["relevance"] = round(_heuristic_relevance(r.get("title", ""), r.get("link", ""), search_term), 3)
+                if not r.get("clickability"):
+                    r["clickability"] = round(_heuristic_clickability(r.get("title", ""), r.get("image")), 3)
+                if not r.get("trust"):
+                    r["trust"] = round(_heuristic_trust(r.get("domain")), 3)
+                if not r.get("score"):
+                    score = 0.5 * float(r["relevance"]) + 0.3 * float(r["clickability"]) + 0.2 * float(r["trust"])
+                    r["score"] = round(max(0.0, min(1.0, score)), 4)
+
+        # persist memory & DBs
         try:
-            self.memory.save_task(search_term, None, steps_taken=steps_log)
+            self.memory.save_task(search_term, {"search_term": search_term, "results": results, "summary": summary}, steps_taken=steps_log)
         except Exception:
             pass
+
         if _DB_HELPERS_AVAILABLE and search_id is not None:
             try:
+                bulk_insert_results(self.results_db, search_id, results)
                 mark_search_completed(self.searches_db, search_id)
-                save_memory(self.memory_db, search_id, search_term, steps_log, summary=None)
-            except Exception:
-                pass
-        return TaskResult(success=False, data=None, error_message="All attempts (Playwright + HTTP) failed or returned no results", steps_taken=steps_log)
+                try:
+                    save_memory(self.memory_db, search_id, search_term, steps_log, summary=summary)
+                except Exception as e:
+                    steps_log.append(f"[db] save_memory failed: {repr(e)}")
+            except Exception as e:
+                steps_log.append(f"[db] bulk_insert_results/mark_search_completed failed: {repr(e)}")
+
+        payload = {"search_term": search_term, "results": results, "summary": summary, "search_id": search_id}
+        return TaskResult(success=True, data=payload, steps_taken=steps_log)
 
     async def execute_instruction(self, instruction: str) -> TaskResult:
         step = TaskStep(step_id=1, description=f"Search for {instruction}", action="search", parameters={"search_term": instruction})
@@ -664,11 +789,10 @@ class EnhancedWebAgent:
         return result
 
 
-# CLI runner
+# ---------- CLI ----------
 async def main():
-    # by default headless True (no visible browser)
     agent = EnhancedWebAgent(headless=True, db_dir=".")
-    # optionally load your local model quietly (uncomment and adjust path)
+    # uncomment to load model quietly:
     # agent.load_local_mistral_model("model/mistral-7b-openorca.gguf2.Q4_0.gguf")
     await agent.start()
     try:
@@ -683,5 +807,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # run as module-friendly async main
     asyncio.run(main())
