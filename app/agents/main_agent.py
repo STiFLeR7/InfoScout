@@ -1,16 +1,22 @@
-# main_agent.py
+# app/agents/main_agent.py
 """
-Main agent for InfoScout — Google-only, DB-integrated, with optional reranker & image-cacher hooks.
+InfoScout — EnhancedWebAgent (Google-only, DB-integrated, headless by default)
 
-Key behaviors:
-- Robust imports for app.db.db_helpers, app.llm.reranker, app.utils.image_cache (with top-level fallbacks)
-- Uses absolute DB paths under db_dir: searches.db, results.db, memory.db
-- After persisting results to DB, will optionally call reranker and image cache hooks (if available)
+Responsibilities:
+- Robust imports for db_helpers and reranker
+- Playwright-based Google SERP extraction + HTTP (bs4/regex) fallback
+- Image (og:image / favicon) fetch
+- Quiet local model loading (llama-cpp-python) and fallback to heuristics
+- Calls into reranker.rerank_search for scoring & summary
 """
 import asyncio
+import contextlib
 import json
+import os
 import re
 import sqlite3
+import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urljoin
 
 # -------------------------
-# resilient db_helpers import
+# resilient imports (db_helpers, reranker)
 # -------------------------
 _DB_HELPERS_AVAILABLE = False
 try:
@@ -50,34 +56,20 @@ except Exception as e_primary:
         print("   fallback import error:", repr(e_fallback), flush=True)
         _DB_HELPERS_AVAILABLE = False
 
-# -------------------------
-# optional reranker & image_cache imports (resilient)
-# -------------------------
+# reranker import (optional)
 _RERANKER_AVAILABLE = False
-_IMAGE_CACHE_AVAILABLE = False
 try:
     from app.llm.reranker import rerank_search
-    _RERANKER_AVAILABLE = True
     print("ℹ️ Imported rerank_search from app.llm.reranker", flush=True)
-except Exception as e:
+    _RERANKER_AVAILABLE = True
+except Exception:
     try:
-        from llm.reranker import rerank_search
-        _RERANKER_AVAILABLE = True
+        from llm.reranker import rerank_search  # top-level fallback
         print("ℹ️ Imported rerank_search from llm.reranker (top-level)", flush=True)
-    except Exception as e2:
+        _RERANKER_AVAILABLE = True
+    except Exception:
         print("⚠️ reranker import failed (app.llm.reranker / llm.reranker).", flush=True)
-
-try:
-    from app.utils.image_cache import cache_images_for_search
-    _IMAGE_CACHE_AVAILABLE = True
-    print("ℹ️ Imported cache_images_for_search from app.utils.image_cache", flush=True)
-except Exception as e:
-    try:
-        from utils.image_cache import cache_images_for_search
-        _IMAGE_CACHE_AVAILABLE = True
-        print("ℹ️ Imported cache_images_for_search from utils.image_cache (top-level)", flush=True)
-    except Exception as e2:
-        print("⚠️ image_cache import failed (app.utils.image_cache / utils.image_cache).", flush=True)
+        _RERANKER_AVAILABLE = False
 
 # -------------------------
 # optional Playwright & BeautifulSoup
@@ -95,6 +87,18 @@ try:
 except Exception:
     BeautifulSoup = None
     _BS4_AVAILABLE = False
+
+# -------------------------
+# try Llama binding availability (we load later quietly)
+# -------------------------
+_LLAMACPP_AVAILABLE = False
+_LLAMACPP_ERR = None
+try:
+    from llama_cpp import Llama  # type: ignore
+    _LLAMACPP_AVAILABLE = True
+except Exception as e:
+    _LLAMACPP_AVAILABLE = False
+    _LLAMACPP_ERR = e
 
 # -------------------------
 # dataclasses & TaskMemory
@@ -179,7 +183,7 @@ class SimpleMistralParser:
         self.loader_repr: Optional[str] = None
 
 # -------------------------
-# Helpers
+# Helpers: normalize and image fetch
 # -------------------------
 def extract_domain(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -202,7 +206,7 @@ def normalize_url(url: Optional[str], base_scheme: str = "https") -> Optional[st
         return url
     return None
 
-def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
+def _fetch_og_or_favicon(url: str, steps_log: List[str], timeout: int = 6) -> Optional[str]:
     try:
         import requests
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -210,7 +214,7 @@ def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
         if not norm:
             steps_log.append(f"[image-fetch] cannot normalize url: {url}")
             return None
-        resp = requests.get(norm, headers=headers, timeout=6)
+        resp = requests.get(norm, headers=headers, timeout=timeout)
         html = resp.text or ""
         if _BS4_AVAILABLE:
             try:
@@ -237,15 +241,88 @@ def _fetch_og_or_favicon(url: str, steps_log: List[str]) -> Optional[str]:
     return None
 
 # -------------------------
+# Silence native stdout/stderr for model load
+# -------------------------
+@contextlib.contextmanager
+def _suppress_native_output():
+    """
+    Redirects OS-level stdout/stderr to devnull for the context duration,
+    to silence native library prints (like llama.cpp).
+    """
+    devnull = open(os.devnull, "w")
+    try:
+        orig_stdout_fd = os.dup(1)
+        orig_stderr_fd = os.dup(2)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(orig_stdout_fd, 1)
+            os.dup2(orig_stderr_fd, 2)
+            os.close(orig_stdout_fd)
+            os.close(orig_stderr_fd)
+            devnull.close()
+    except Exception:
+        # fallback to Python-level redirect if dup ops fail
+        with contextlib.redirect_stdout(open(os.devnull, "w")), contextlib.redirect_stderr(open(os.devnull, "w")):
+            yield
+
+# -------------------------
+# Model-call adapter (used only when model loaded)
+# -------------------------
+async def _call_model(model_obj, prompt: str, max_tokens: int = 128, stop: Optional[List[str]] = None) -> str:
+    """
+    Call the local model wrapper in a thread; handle several common wrapper shapes.
+    Returns textual output or raises.
+    """
+    def _sync():
+        # prefer callable usage (llama-cpp-python supports calling the Llama instance)
+        if hasattr(model_obj, "create"):
+            out = model_obj.create(prompt=prompt, max_tokens=max_tokens, temperature=0.0, stop=stop or ["\n"])
+            if isinstance(out, dict):
+                if "choices" in out and out["choices"]:
+                    ch = out["choices"][0]
+                    if isinstance(ch, dict):
+                        return ch.get("text") or ch.get("message", {}).get("content", "") or str(ch)
+                    return str(ch)
+                if "text" in out:
+                    return out["text"]
+                return str(out)
+            return str(out)
+        if callable(model_obj):
+            try:
+                out = model_obj(prompt, max_tokens=max_tokens, temperature=0.0)
+            except TypeError:
+                out = model_obj(prompt)
+            if isinstance(out, dict):
+                if "choices" in out and out["choices"]:
+                    ch = out["choices"][0]
+                    if isinstance(ch, dict):
+                        return ch.get("text") or ch.get("message", {}).get("content", "") or str(ch)
+                    return str(ch)
+                if "text" in out:
+                    return out["text"]
+            return str(out)
+        if hasattr(model_obj, "generate"):
+            try:
+                out = model_obj.generate(prompt=prompt, max_tokens=max_tokens)
+            except TypeError:
+                out = model_obj.generate(prompt)
+            return str(out)
+        raise AttributeError("Unsupported model call interface.")
+    return await asyncio.to_thread(_sync)
+
+# -------------------------
 # EnhancedWebAgent
 # -------------------------
 class EnhancedWebAgent:
-    def __init__(self, headless: bool = True, db_dir: str = ".", auto_rerank: bool = False, auto_image_cache: bool = False, reranker_model_path: Optional[str] = None):
+    def __init__(self, headless: bool = True, db_dir: str = ".", model_path: Optional[str] = None, quiet_model_load: bool = True):
         # canonicalize db_dir
         self.db_dir = Path(db_dir).resolve()
         self.db_dir.mkdir(parents=True, exist_ok=True)
 
-        # initialize DBs with helper if available
+        # init DBs
         if _DB_HELPERS_AVAILABLE:
             try:
                 init_all_dbs(str(self.db_dir))
@@ -253,35 +330,39 @@ class EnhancedWebAgent:
             except Exception as e:
                 print("⚠️ init_all_dbs failed:", e, flush=True)
 
-        # absolute DB paths
         self.searches_db = str(self.db_dir / "searches.db")
         self.results_db = str(self.db_dir / "results.db")
         self.memory_db = str(self.db_dir / "memory.db")
 
-        # ensure TaskMemory uses same memory_db
         self.memory = TaskMemory(db_path=self.memory_db)
 
-        # Playwright state
+        # Playwright
         self.page = None
         self.context = None
         self._playwright = None
         self.headless = headless
 
-        # model / reranker config
+        # model
         self.mistral_parser = SimpleMistralParser()
-        self.reranker_model_path = reranker_model_path
-        self.auto_rerank = bool(auto_rerank) and _RERANKER_AVAILABLE
-        self.auto_image_cache = bool(auto_image_cache) and _IMAGE_CACHE_AVAILABLE
+        self.model_path = model_path
+        self.quiet_model_load = quiet_model_load
+        if model_path:
+            ok = self.load_local_mistral_model(model_path, quiet=quiet_model_load)
+            if ok:
+                print(f"✅ Local model loaded at: {model_path}", flush=True)
+            else:
+                print("⚠️ Local model not loaded; using heuristics-only fallback.", flush=True)
+        else:
+            if _LLAMACPP_AVAILABLE:
+                print("ℹ️ llama_cpp available but model_path not provided.", flush=True)
+            else:
+                print("⚠️ llama_cpp not available:", repr(_LLAMACPP_ERR), flush=True)
 
-        # Playwright profile dir
+        # Playwright profile
         self.user_data_dir = Path(".playwright_profile").resolve()
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"🤖 EnhancedWebAgent initialized (headless={self.headless}). DB dir={self.db_dir}", flush=True)
-        if auto_rerank and not _RERANKER_AVAILABLE:
-            print("⚠️ auto_rerank requested but reranker not available (import failed).", flush=True)
-        if auto_image_cache and not _IMAGE_CACHE_AVAILABLE:
-            print("⚠️ auto_image_cache requested but image_cache not available (import failed).", flush=True)
 
     # lifecycle
     async def start(self):
@@ -338,37 +419,75 @@ class EnhancedWebAgent:
         except Exception:
             pass
 
-    # optional local model loader (unchanged)
-    def load_local_mistral_model(self, path: str, force_mark_if_exists: bool = True) -> bool:
+    # Quiet model load
+    def load_local_mistral_model(self, path: str, force_mark_if_exists: bool = True, quiet: bool = True) -> bool:
         p = Path(path)
         resolved = str(p.resolve()) if p.exists() else None
+        self.model_path = resolved
         self.mistral_parser.model_path = resolved
+
+        if not p.exists():
+            print("⚠️ model file not found:", path, flush=True)
+            return False
+
+        if not _LLAMACPP_AVAILABLE:
+            print("⚠️ llama_cpp not installed:", repr(_LLAMACPP_ERR), flush=True)
+            if p.exists() and force_mark_if_exists:
+                # mark presence but don't bind loader
+                self.mistral_parser.model_loaded = True
+                self.mistral_parser.model_name = p.name
+                self.mistral_parser.loader_repr = "<file present, llama_cpp not installed>"
+                self.model_loaded = True
+                return False
+            return False
+
+        # small noop callback to reduce native logging if the binding exposes it
         try:
-            from llama_cpp import Llama
-            if p.exists():
+            import llama_cpp as _lc
+            if hasattr(_lc, "llama_log_set"):
                 try:
-                    llama = Llama(model_path=str(p))
-                    self.mistral_parser.model_obj = llama
-                    self.mistral_parser.model_loaded = True
-                    self.mistral_parser.model_name = getattr(llama, "__repr__", lambda: "llama_model")()
-                    self.mistral_parser.loader_repr = repr(llama)[:1000]
-                    print(f"✅ Loaded local model via llama_cpp at: {resolved}", flush=True)
-                    return True
-                except Exception as e:
-                    print(f"⚠️ llama_cpp failed to load model at {p}: {e}", flush=True)
+                    # register a minimal callback (ctypes) if available
+                    def _noop_cb(msg_ptr, userp):
+                        return
+                    try:
+                        _lc.llama_log_set(_noop_cb)
+                    except Exception:
+                        # some bindings expect a specific ctypes signature; ignore if incompatible
+                        pass
+                except Exception:
+                    pass
         except Exception:
             pass
-        if p.exists() and force_mark_if_exists:
+
+        try:
+            if quiet:
+                with _suppress_native_output():
+                    model = Llama(model_path=str(p), n_ctx=2048, n_threads=os.cpu_count() or 4, verbose=False, use_mlock=False)
+            else:
+                model = Llama(model_path=str(p), n_ctx=2048, n_threads=os.cpu_count() or 4, verbose=False, use_mlock=False)
+            self.mistral_parser.model_obj = model
             self.mistral_parser.model_loaded = True
-            self.mistral_parser.model_name = p.name
-            self.mistral_parser.loader_repr = "<file present, loader not bound>"
-            print(f"ℹ️ Model file exists at {resolved}. Marked as present.", flush=True)
+            self.mistral_parser.model_name = getattr(model, "__repr__", lambda: "llama_model")()
+            self.mistral_parser.loader_repr = repr(model)[:1000]
+            self.model_loaded = True
+            print(f"✅ Loaded local model via llama_cpp at: {self.model_path}", flush=True)
             return True
+        except Exception as e:
+            print(f"⚠️ llama_cpp failed to load model at {p}: {e}", flush=True)
+            # mark file present if requested so agent can still run heuristics and mark DB
+            if p.exists() and force_mark_if_exists:
+                self.mistral_parser.model_loaded = True
+                self.mistral_parser.model_name = p.name
+                self.mistral_parser.loader_repr = "<file present, loader not bound>"
+                self.model_loaded = True
+                self.mistral_parser.model_path = str(p.resolve())
+                print(f"ℹ️ Model file exists at {self.model_path}. Marked as present (load failed).", flush=True)
+                return True
         self.mistral_parser.model_loaded = False
-        print("⚠️ No local model loaded.", flush=True)
+        self.model_loaded = False
         return False
 
-    # Playwright extraction for Google SERP (unchanged)
+    # Playwright extraction
     async def _extract_with_playwright_google(self, url: str, search_term: str, steps_log: List[str]) -> Optional[List[Dict]]:
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -425,7 +544,7 @@ class EnhancedWebAgent:
             steps_log.append(f"[playwright] goto/error: {repr(e)}")
             return None
 
-    # HTTP fallbacks (unchanged)
+    # HTTP fallback
     def _http_extract_google_bs4(self, html: str, steps_log: List[str]) -> List[Dict]:
         results = []
         if not _BS4_AVAILABLE:
@@ -512,7 +631,7 @@ class EnhancedWebAgent:
         q = up.quote_plus(search_term)
         url = f"https://www.google.com/search?q={q}&num=10&hl=en&pws=0"
 
-        # create search record (use absolute path)
+        # create search record
         search_id = None
         if _DB_HELPERS_AVAILABLE:
             try:
@@ -527,7 +646,7 @@ class EnhancedWebAgent:
             print("⚠️ db_helpers not available; skipping DB writes.", flush=True)
 
         results = None
-        # Playwright path
+        # Playwright
         if self.page is not None:
             try:
                 results = await self._extract_with_playwright_google(url, search_term, steps_log)
@@ -538,21 +657,21 @@ class EnhancedWebAgent:
             except Exception as e:
                 steps_log.append(f"[playwright] extraction exception: {repr(e)}")
 
-        # HTTP fallback (Google only)
+        # HTTP fallback
         if not results:
             http_res = await self._http_fetch_and_extract(url, steps_log)
             if http_res:
                 results = http_res
                 steps_log.append(f"[flow] HTTP fetch returned {len(results)} results.")
 
-        # If we have results, enrich and save
+        # enrich results (image + scoring/summarization via reranker)
         if results:
             for r in results:
                 link = r.get("link")
                 r["link"] = normalize_url(link) or link
                 r["domain"] = extract_domain(r["link"])
                 try:
-                    img = _fetch_og_or_favicon(r["link"], steps_log) if r["link"] else None
+                    img = _fetch_og_or_favicon(r["link"], steps_log)
                 except Exception as e:
                     steps_log.append(f"[image-fetch] error for {r.get('link')}: {repr(e)}")
                     img = None
@@ -563,50 +682,66 @@ class EnhancedWebAgent:
                 r.setdefault("trust", 0.0)
                 r["extra"] = r.get("extra", {})
 
-            # persist TaskMemory
+            # run reranker if present, else try inline fallback
+            results_enriched = results
+            summary_text = None
+            if _RERANKER_AVAILABLE:
+                try:
+                    # rerank_search(model, query, results, steps_log) -> {results, summary}
+                    model_obj = getattr(self.mistral_parser, "model_obj", None)
+                    rr = rerank_search(model_obj, search_term, results, steps_log)
+                    # rerank_search may be sync or return dict; handle both
+                    if isinstance(rr, dict) and "results" in rr:
+                        results_enriched = rr["results"]
+                        summary_text = rr.get("summary")
+                    else:
+                        # assume sync list
+                        results_enriched = rr
+                except Exception as e:
+                    steps_log.append(f"[reranker] failed: {repr(e)}")
+                    traceback.print_exc()
+            else:
+                # no reranker module — try a tiny builtin heuristic summary
+                try:
+                    # simplest: compute heuristic score (relevance heuristics)
+                    def heuristic_score(r):
+                        title = (r.get("title") or "").lower()
+                        img = bool(r.get("image"))
+                        domain = r.get("domain") or ""
+                        rel = 0.35 + min(0.65, len(title.split()) / 20.0)
+                        clk = 0.2 + (0.5 if img else 0.0)
+                        trust = 0.3 + (0.4 if any(t in domain for t in ("apple.com", "wikipedia.org", "macrumors.com", "gsmarena.com")) else 0.0)
+                        return round(max(0.0, min(1.0, rel)),4), round(clk,4), round(trust,4)
+                    for r in results_enriched:
+                        rel, clk, trust = heuristic_score(r)
+                        r["relevance"] = rel
+                        r["clickability"] = clk
+                        r["trust"] = trust
+                        r["score"] = round(0.6 * rel + 0.15 * clk + 0.25 * trust, 4)
+                    summary_text = f"Top result: {results_enriched[0].get('title','').strip()}" if results_enriched else ""
+                    steps_log.append("[heuristic-summary] used fallback summary")
+                except Exception as e:
+                    steps_log.append(f"[heuristic-summary] failed: {repr(e)}")
+
+            # persist backward-compatible memory
             try:
-                self.memory.save_task(search_term, {"search_term": search_term, "results": results}, steps_taken=steps_log)
+                self.memory.save_task(search_term, {"search_term": search_term, "results": results_enriched, "summary": summary_text}, steps_taken=steps_log)
             except Exception:
                 pass
 
-            # persist to results DB (use absolute paths)
+            # DB writes via helpers
             if _DB_HELPERS_AVAILABLE and search_id is not None:
                 try:
-                    bulk_insert_results(self.results_db, search_id, results)
+                    bulk_insert_results(self.results_db, search_id, results_enriched)
                     mark_search_completed(self.searches_db, search_id)
                     try:
-                        save_memory(self.memory_db, search_id, search_term, steps_log, summary=None)
+                        save_memory(self.memory_db, search_id, search_term, steps_log, summary=summary_text)
                     except Exception as e:
                         steps_log.append(f"[db] save_memory failed: {repr(e)}")
                 except Exception as e:
                     steps_log.append(f"[db] bulk_insert_results/mark_search_completed failed: {repr(e)}")
 
-            # POST-PROCESS: rerank & image-cache (if available and enabled)
-            # run reranker (best-effort)
-            if self.auto_rerank:
-                try:
-                    # call reranker.rerank_search(results_db, searches_db, search_id, model_path)
-                    model_path = self.reranker_model_path
-                    # rerank_search expects (results_db, searches_db, search_id, model_path=..., batch=...)
-                    print(f"[post] auto_rerank enabled; invoking reranker for search_id={search_id}", flush=True)
-                    rerank_search(self.results_db, self.searches_db, search_id, model_path=model_path)
-                    steps_log.append("[post] reranker invoked")
-                except Exception as e:
-                    steps_log.append(f"[post] reranker failed: {repr(e)}")
-                    print("[post] reranker failed:", traceback.format_exc(), flush=True)
-
-            # run image cache (best-effort)
-            if self.auto_image_cache:
-                try:
-                    print(f"[post] auto_image_cache enabled; invoking image_cache for search_id={search_id}", flush=True)
-                    # cache_images_for_search(db_dir, search_id, max_workers=6)
-                    cache_images_for_search(str(self.db_dir), search_id, max_workers=6)
-                    steps_log.append("[post] image_cache invoked")
-                except Exception as e:
-                    steps_log.append(f"[post] image_cache failed: {repr(e)}")
-                    print("[post] image_cache failed:", traceback.format_exc(), flush=True)
-
-            payload = {"search_term": search_term, "results": results, "search_id": search_id}
+            payload = {"search_term": search_term, "results": results_enriched, "summary": summary_text, "search_id": search_id}
             return TaskResult(success=True, data=payload, steps_taken=steps_log)
 
         # final failure
@@ -633,10 +768,8 @@ class EnhancedWebAgent:
 
 # CLI runner
 async def main():
-    # set auto_rerank and auto_image_cache to True if you want post-processing
-    agent = EnhancedWebAgent(headless=True, db_dir=".", auto_rerank=False, auto_image_cache=False, reranker_model_path=None)
-    # optionally load a local model:
-    # agent.load_local_mistral_model("model/mistral-7b-openorca.gguf2.Q4_0.gguf")
+    model_path = "model/mistral-7b-openorca.gguf2.Q4_0.gguf"  # adjust as needed
+    agent = EnhancedWebAgent(headless=True, db_dir=".", model_path=model_path, quiet_model_load=True)
     await agent.start()
     try:
         while True:

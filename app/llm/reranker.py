@@ -1,295 +1,281 @@
 # app/llm/reranker.py
 """
-Reranker: score results (relevance / clickability / trust) using
-- Primary: local LLM via llama_cpp (if installed)
-- Fallback: lightweight heuristic scoring (domain trust + image presence + title/snippet matching)
+Async-friendly reranker + summary helper.
 
-Writes scores back into results.db. Uses db_helpers update function if available,
-otherwise performs direct sqlite updates.
+Usage:
+    from app.llm.reranker import rerank_search
 
-Usage examples:
-    # rerank last search in DB
-    python -m app.llm.reranker --db-dir . --search-id LAST
+API:
+    async def rerank_search(model_obj, query: str, results: List[Dict], max_model_calls: int=5)
+    -> returns (results_with_scores, summary_str, steps_log)
 
-    # rerank every search (careful)
-    python -m app.llm.reranker --db-dir . --all --batch 8
+Notes:
+- If model_obj is None, or if the model-call fails, the function uses heuristics to produce
+  relevance/clickability/trust scores and a short heuristic summary.
+- If model_obj is provided, we call it in a background thread using asyncio.to_thread() to avoid
+  "asyncio.run() cannot be called from a running event loop" problems.
+- Supports llama_cpp Llama objects that expose either `.create()`, `.generate()`, `.__call__()` or other sync APIs.
 """
-import argparse
+from __future__ import annotations
+
+import asyncio
 import json
 import math
-import sqlite3
-import statistics
-from pathlib import Path
-from typing import List, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
-# try to import db_helpers from package or top-level
-try:
-    from app.db.db_helpers import update_result_score, fetch_results_for_search, list_searches
-    _DB_HELPERS = True
-except Exception:
-    _DB_HELPERS = False
-
-# try to import llama_cpp
-try:
-    from llama_cpp import Llama
-    _LLAMA_CPP = True
-except Exception:
-    _LLAMA_CPP = False
-
-SANE_BATCH = 8
+# Simple tokenizer for heuristic overlap
+_WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
 
 
-def heuristic_score(result: Dict) -> Dict[str, float]:
-    """Compute a simple heuristic score if no LLM available."""
-    score = {"relevance": 0.0, "clickability": 0.0, "trust": 0.0}
-    title = (result.get("title") or "").lower()
-    snippet = (result.get("snippet") or "").lower()
-    domain = (result.get("domain") or "").lower()
-    image = result.get("image")
-    # relevance: presence of query-like words in title/snippet -> +0.6
-    words = title.split() + snippet.split()
-    word_score = min(1.0, sum(1 for w in words if len(w) > 3) / 20.0)
-    score["relevance"] = 0.3 + 0.4 * word_score
-    # clickability: if there's image or youtube link -> boost
-    score["clickability"] = 0.2 + (0.5 if image else 0.0)
-    if "youtube.com" in domain or "youtu.be" in domain:
-        score["clickability"] += 0.2
-    score["clickability"] = min(1.0, score["clickability"])
-    # trust: domain heuristics (official domains get higher score)
-    trusted = ("apple.com", "wikipedia.org", "nytimes.com", "bbc.co", "macrumors.com", "gsmarena.com")
-    score["trust"] = 0.3 + (0.5 if any(t in domain for t in trusted) else 0.0)
-    # small normalization
-    for k in score:
-        score[k] = round(float(score[k]), 4)
-    return score
+def _tokens(text: str) -> List[str]:
+    if not text:
+        return []
+    return [t.lower() for t in _WORD_RE.findall(text)]
 
 
-def llama_score_batch(model: Llama, prompt_list: List[str]) -> List[float]:
+def _token_overlap_score(query: str, text: str) -> float:
+    qtok = set(_tokens(query))
+    ttok = set(_tokens(text))
+    if not qtok:
+        return 0.0
+    return len(qtok & ttok) / len(qtok)
+
+
+def _heuristic_scores(query: str, title: str, domain: Optional[str], has_image: bool) -> Dict[str, float]:
+    # relevance: token-overlap & title similarity (0-1)
+    rel = _token_overlap_score(query, (title or "")) * 0.95
+    # domain boost for authoritative domains
+    authoritative = ("edu", "gov", "ac.", "nature.com", "arxiv.org", "ieee.org", "springer", "ncbi.nlm.nih.gov")
+    trust = 0.3
+    if domain:
+        dom = domain.lower()
+        if any(d in dom for d in authoritative):
+            trust = 0.75
+        elif dom.endswith(".org") or dom.endswith(".com"):
+            trust = 0.45
+    # clickability: short titles + image help
+    click = 0.45 + (0.25 if len((title or "")) < 80 else 0.0) + (0.2 if has_image else 0.0)
+    click = min(1.0, click)
+    # normalize relevance to reasonable range
+    rel = max(0.0, min(1.0, rel))
+    return {"relevance": round(rel, 4), "clickability": round(click, 4), "trust": round(trust, 4)}
+
+
+# ---------- model calling helpers ----------
+def _find_sync_model_api(model_obj: Any):
     """
-    Send multiple prompts to local Llama model and parse numeric scores.
-    This is a heuristic prompt: ask the model to output a float 0.0-1.0.
-    Implementation depends on llama_cpp API; we use create() where available.
-    If parsing fails, return NaNs to fall back later.
+    Return a synchronous callable that accepts (prompt: str, max_tokens: int) -> str
+    tries known patterns (.create, .generate, __call__, .completion) and wraps them to return text.
+    Returns None if no known API was detected.
     """
-    scores = []
-    for prompt in prompt_list:
-        try:
-            # conservative generation: ask for a single-token numeric answer
-            out = model.create(prompt=prompt, max_tokens=16, temperature=0.0, stop=["\n"])
-            # depending on version, out may be dict with 'choices'
-            text = ""
-            if isinstance(out, dict):
-                # new llama_cpp returns choices -> text
-                choices = out.get("choices")
-                if choices:
-                    text = choices[0].get("text", "") if isinstance(choices[0], dict) else str(choices[0])
-                else:
-                    text = str(out.get("text", ""))
-            else:
-                text = str(out)
-            # try to extract float
-            toks = text.strip().split()
-            # find first token that looks like a float
-            val = None
-            for t in toks:
+    if model_obj is None:
+        return None
+
+    # llama_cpp (newer) often exposes .create(messages=..., max_tokens=...)
+    if hasattr(model_obj, "create"):
+        def _call_sync(prompt: str, max_tokens: int = 256) -> str:
+            # map to messages chat style if model wants it
+            try:
+                # try chat-style call
+                resp = model_obj.create(messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+                # try to extract text
+                if isinstance(resp, dict):
+                    # many llama_cpp wrappers return dict-like
+                    if "choices" in resp and len(resp["choices"]) > 0:
+                        c = resp["choices"][0]
+                        if isinstance(c, dict) and "message" in c and "content" in c["message"]:
+                            return c["message"]["content"]
+                        if isinstance(c, dict) and "text" in c:
+                            return c["text"]
+                # fallback str()
+                return str(resp)
+            except Exception:
+                # fallback attempt single string completion
                 try:
-                    v = float(t.strip().strip(".,"))
-                    val = v
-                    break
+                    resp = model_obj.create(prompt=prompt, max_tokens=max_tokens)
+                    return str(resp)
+                except Exception as e:
+                    raise
+
+        return _call_sync
+
+    # huggingface-like .generate or text-generation API
+    if hasattr(model_obj, "generate"):
+        def _call_sync(prompt: str, max_tokens: int = 256) -> str:
+            try:
+                gen = model_obj.generate(prompt, max_tokens=max_tokens)
+                return str(gen)
+            except Exception as e:
+                raise
+        return _call_sync
+
+    # callable model obj
+    if callable(model_obj):
+        def _call_sync(prompt: str, max_tokens: int = 256) -> str:
+            try:
+                out = model_obj(prompt)
+                return str(out)
+            except Exception:
+                raise
+        return _call_sync
+
+    return None
+
+
+async def _call_model_async(model_obj: Any, prompt: str, max_tokens: int = 256) -> str:
+    """
+    Safely call a blocking model API from async context via asyncio.to_thread.
+    """
+    sync_fn = _find_sync_model_api(model_obj)
+    if sync_fn is None:
+        raise RuntimeError("No supported sync model API found on model_obj")
+    # run in threadpool
+    return await asyncio.to_thread(sync_fn, prompt, max_tokens)
+
+
+# ---------- main exposed function ----------
+async def rerank_search(
+    model_obj: Optional[Any],
+    query: str,
+    results: List[Dict[str, Any]],
+    max_model_calls: int = 4,
+) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    """
+    Rerank results and optionally summarize using the provided local model.
+
+    Returns:
+      - results: same list enriched with 'score','relevance','clickability','trust' fields
+      - summary: short summary string
+      - steps: list of debug/logging strings
+    """
+    steps: List[str] = []
+    # basic heuristic pass
+    for r in results:
+        title = r.get("title") or ""
+        domain = r.get("domain")
+        has_image = bool(r.get("image"))
+        hs = _heuristic_scores(query, title, domain, has_image)
+        r.setdefault("relevance", hs["relevance"])
+        r.setdefault("clickability", hs["clickability"])
+        r.setdefault("trust", hs["trust"])
+        # combined score weighted
+        r["score"] = round(0.55 * r["relevance"] + 0.25 * r["clickability"] + 0.2 * r["trust"], 4)
+
+    # attempt to use model to refine top-N
+    if model_obj is None:
+        steps.append("[reranker-heuristic] no model provided; used heuristic scoring")
+        # produce a heuristic summary
+        top = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)[:3]
+        summary = "Top results: " + "; ".join([f"{t.get('title','(no title)')} ({t.get('domain')})" for t in top])
+        steps.append("[reranker-heuristic] summary produced")
+        return results, summary, steps
+
+    # call model for a compact re-ranking prompt; limit number of candidates to avoid long calls
+    candidates = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)[: min(len(results), max_model_calls * 3)]
+    # build concise prompt
+    prompt_lines = [
+        "You are an assistant that rates search results for a user query.",
+        "For each item produce a JSON list element with fields: relevance (0-1), trust (0-1), clickability (0-1).",
+        "Also return a short summary (1-2 sentences) describing the best sources."
+    ]
+    prompt_lines.append(f"Query: {query}")
+    prompt_lines.append("Items:")
+    for i, c in enumerate(candidates, start=1):
+        prompt_lines.append(f"{i}. Title: {c.get('title','')}")
+        prompt_lines.append(f"   Link: {c.get('link','')}")
+        if c.get("snippet"):
+            s = c.get("snippet")[:300].replace("\n", " ")
+            prompt_lines.append(f"   Snippet: {s}")
+        if c.get("domain"):
+            prompt_lines.append(f"   Domain: {c.get('domain')}")
+    prompt_lines.append("Return a JSON object like: {\"scores\": [{\"index\":1,\"relevance\":0.9,\"trust\":0.8,\"clickability\":0.7},...], \"summary\":\"...\"}")
+    prompt = "\n".join(prompt_lines)
+
+    # call the model safely
+    try:
+        steps.append("[reranker-model] attempting model call")
+        raw = await _call_model_async(model_obj, prompt, max_tokens=256)
+        if not raw:
+            raise RuntimeError("empty model output")
+        # try to extract JSON blob
+        first_json = None
+        # heuristic: find first '{' that starts a JSON object
+        start = raw.find("{")
+        if start != -1:
+            candidate = raw[start:]
+            try:
+                parsed = json.loads(candidate)
+                first_json = parsed
+            except Exception:
+                # attempt to extract trailing JSON-like lines
+                try:
+                    # look for balanced braces
+                    stack = 0
+                    end_idx = None
+                    for idx, ch in enumerate(candidate):
+                        if ch == "{":
+                            stack += 1
+                        elif ch == "}":
+                            stack -= 1
+                            if stack == 0:
+                                end_idx = idx + 1
+                                break
+                    if end_idx:
+                        candidate2 = candidate[:end_idx]
+                        parsed = json.loads(candidate2)
+                        first_json = parsed
                 except Exception:
-                    continue
-            if val is None:
-                # try to parse words like "0.73" inside text
-                import re
-                m = re.search(r"([0-9]*\.[0-9]+|[01])", text)
-                if m:
-                    val = float(m.group(1))
-            if val is None:
-                scores.append(float("nan"))
-            else:
-                # clamp to [0,1]
-                scores.append(max(0.0, min(1.0, float(val))))
-        except Exception:
-            scores.append(float("nan"))
-    return scores
+                    first_json = None
+        if not first_json:
+            # maybe the model returned json in multiple lines or wrote list; try to find any JSON array
+            try:
+                arr_start = raw.find("[")
+                if arr_start != -1:
+                    arr = raw[arr_start:]
+                    parsed = json.loads(arr)
+                    first_json = {"scores": parsed}
+            except Exception:
+                first_json = None
 
-
-def fetch_results_sqlite(results_db: str, search_id: int) -> List[Dict]:
-    """Fallback: fetch results rows using sqlite directly if db_helpers missing."""
-    conn = sqlite3.connect(results_db)
-    cur = conn.cursor()
-    cur.execute("SELECT id, rank, title, link, snippet, image, extra FROM results WHERE search_id = ? ORDER BY rank ASC", (search_id,))
-    rows = cur.fetchall()
-    results = []
-    for r in rows:
-        rid, rank, title, link, snippet, image, extra = r
-        try:
-            extra_j = json.loads(extra) if extra else {}
-        except Exception:
-            extra_j = {}
-        results.append({"row_id": rid, "rank": rank, "title": title, "link": link, "snippet": snippet, "image": image, "extra": extra_j})
-    conn.close()
-    return results
-
-
-def update_result_scores_sqlite(results_db: str, updates: List[Dict]):
-    """Fallback update function to write scores into results.db directly."""
-    conn = sqlite3.connect(results_db)
-    cur = conn.cursor()
-    for u in updates:
-        # u expected: {"row_id": int, "relevance": float, ...}
-        cur.execute("""
-            UPDATE results SET relevance = ?, clickability = ?, trust = ?, score = ?
-            WHERE id = ?
-        """, (u["relevance"], u["clickability"], u["trust"], u.get("score", None), u["row_id"]))
-    conn.commit()
-    conn.close()
-
-
-def compute_overall_score(relevance: float, clickability: float, trust: float) -> float:
-    # weighted aggregate — tweakable
-    return round(0.6 * relevance + 0.25 * trust + 0.15 * clickability, 4)
-
-
-def rerank_search(results_db: str, searches_db: str, search_id: int, model_path: Optional[str] = None, batch: int = SANE_BATCH):
-    print(f"-> Reranking search_id={search_id} (results_db={results_db})")
-    if _DB_HELPERS:
-        rows = fetch_results_for_search(results_db, search_id)
-        # expected each row is dict with at least row_id, title, snippet, image, domain
-        results = rows
-    else:
-        results = fetch_results_sqlite(results_db, search_id)
-
-    if not results:
-        print("  no results for search_id:", search_id)
-        return
-
-    # If llama_cpp available and model_path provided (or default), use it
-    use_llama = _LLAMA_CPP and model_path is not None
-    model = None
-    if use_llama:
-        try:
-            model = Llama(model_path=model_path)
-            print("  loaded Llama model for reranking.")
-        except Exception as e:
-            print("  llama_cpp load failed, falling back to heuristic. error:", e)
-            model = None
-            use_llama = False
-
-    updates = []
-    # batch prompts
-    for i in range(0, len(results), batch):
-        batch_results = results[i:i+batch]
-        # prepare prompts if using llama
-        if use_llama and model:
-            prompt_relevance = []
-            prompt_trust = []
-            prompt_click = []
-            for r in batch_results:
-                title = r.get("title") or ""
-                snippet = r.get("snippet") or ""
-                domain = r.get("domain") or ""
-                prompt_relevance.append(
-                    f"Given the query and the result, rate the RELEVANCE from 0.0 (not relevant) to 1.0 (perfectly relevant).\n\nResult title: {title}\nResult snippet: {snippet}\n\nAnswer with a single number between 0 and 1."
-                )
-                prompt_trust.append(
-                    f"Given the result link domain '{domain}', rate the TRUSTWORTHINESS from 0.0 to 1.0 (1.0 = highly trustworthy).\n\nAnswer with a single number between 0 and 1."
-                )
-                prompt_click.append(
-                    f"Given title and snippet, rate the CLICKABILITY (how likely a user is to click) from 0.0 to 1.0.\n\nTitle: {title}\nSnippet: {snippet}\n\nAnswer with a single number 0-1."
-                )
-            # generate scores
-            rel_scores = llama_score_batch(model, prompt_relevance)
-            trust_scores = llama_score_batch(model, prompt_trust)
-            click_scores = llama_score_batch(model, prompt_click)
-            # assign (fall back to heuristic for NaNs)
-            for idx, r in enumerate(batch_results):
-                rel = rel_scores[idx] if not math.isnan(rel_scores[idx]) else None
-                tr = trust_scores[idx] if not math.isnan(trust_scores[idx]) else None
-                cl = click_scores[idx] if not math.isnan(click_scores[idx]) else None
-                if rel is None or tr is None or cl is None:
-                    h = heuristic_score(r)
-                    rel = rel if rel is not None else h["relevance"]
-                    tr = tr if tr is not None else h["trust"]
-                    cl = cl if cl is not None else h["clickability"]
-                overall = compute_overall_score(rel, cl, tr)
-                updates.append({
-                    "row_id": r.get("row_id"),
-                    "relevance": round(rel, 4),
-                    "clickability": round(cl, 4),
-                    "trust": round(tr, 4),
-                    "score": overall
-                })
+        if first_json and isinstance(first_json, dict) and "scores" in first_json:
+            steps.append("[reranker-model] parsed JSON from model output")
+            # map model scores into results: assume index refers to presented order (1-based)
+            scores = first_json.get("scores", [])
+            for sc in scores:
+                idx = sc.get("index")
+                # map by index into candidates list
+                if idx and 1 <= int(idx) <= len(candidates):
+                    target = candidates[int(idx) - 1]
+                    # update fields if present
+                    if "relevance" in sc:
+                        target["relevance"] = float(sc["relevance"])
+                    if "trust" in sc:
+                        target["trust"] = float(sc["trust"])
+                    if "clickability" in sc:
+                        target["clickability"] = float(sc["clickability"])
+                    target["score"] = round(0.55 * target["relevance"] + 0.25 * target["clickability"] + 0.2 * target["trust"], 4)
+            # update the main results list with candidate updates
+            cand_links = {c["link"]: c for c in candidates}
+            for r in results:
+                if r.get("link") in cand_links:
+                    upd = cand_links[r["link"]]
+                    r.update({k: upd[k] for k in ("relevance", "clickability", "trust", "score") if k in upd})
+            # summary
+            summ = first_json.get("summary")
+            summary = summ if summ else "Top results available."
+            steps.append("[reranker-model] applied model scores & summary")
+            return results, summary, steps
         else:
-            # heuristic-only path
-            for r in batch_results:
-                h = heuristic_score(r)
-                overall = compute_overall_score(h["relevance"], h["clickability"], h["trust"])
-                updates.append({
-                    "row_id": r.get("row_id"),
-                    "relevance": h["relevance"],
-                    "clickability": h["clickability"],
-                    "trust": h["trust"],
-                    "score": overall
-                })
+            steps.append("[reranker-model] could not parse JSON; falling back to heuristic summary")
+            top = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)[:3]
+            summary = "Top results: " + "; ".join([f"{t.get('title','(no title)')} ({t.get('domain')})" for t in top])
+            return results, summary, steps
 
-    # write updates back to DB
-    if _DB_HELPERS:
-        try:
-            # prefer a db_helpers update function if present
-            update_result_score(results_db, updates)
-            print(f"  wrote {len(updates)} score(s) via db_helpers.update_result_score")
-            return
-        except Exception as e:
-            print("  db_helpers.update_result_score failed, falling back to sqlite. error:", e)
-
-    # fallback: direct sqlite
-    update_result_scores_sqlite(results_db, updates)
-    print(f"  wrote {len(updates)} score(s) via direct sqlite update")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db-dir", type=str, default=".", help="base db dir (where results.db lives)")
-    parser.add_argument("--search-id", type=str, default="LAST", help="search id to rerank or LAST")
-    parser.add_argument("--all", action="store_true", help="rerank all searches")
-    parser.add_argument("--model-path", type=str, default=None, help="path to local gguf/ggml model for llama_cpp")
-    parser.add_argument("--batch", type=int, default=SANE_BATCH, help="batch size for model calls")
-    args = parser.parse_args()
-
-    db_dir = Path(args.db_dir).resolve()
-    results_db = str(db_dir / "results.db")
-    searches_db = str(db_dir / "searches.db")
-
-    # if _DB_HELPERS and user asked for all, we can list searches
-    if args.all and _DB_HELPERS:
-        try:
-            searches = list_searches(searches_db)
-            for s in searches:
-                sid = s["id"]
-                rerank_search(results_db, searches_db, sid, model_path=args.model_path, batch=args.batch)
-            return
-        except Exception as e:
-            print("list_searches failed:", e)
-
-    if args.search_id.upper() == "LAST":
-        # fetch newest search id from searches.db
-        conn = sqlite3.connect(str(searches_db))
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT id FROM searches ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            if not row:
-                print("no searches found in", searches_db)
-                return
-            sid = int(row[0])
-        finally:
-            conn.close()
-    else:
-        sid = int(args.search_id)
-
-    rerank_search(str(results_db), str(searches_db), sid, model_path=args.model_path, batch=args.batch)
-
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        # don't fail the agent — record and fallback
+        steps.append(f"[reranker-model] call failed: {repr(e)}")
+        top = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)[:3]
+        summary = "Top results: " + "; ".join([f"{t.get('title','(no title)')} ({t.get('domain')})" for t in top])
+        steps.append("[reranker-heuristic] fallback used")
+        return results, summary, steps
