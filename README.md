@@ -1,7 +1,3 @@
-Nice — you’ve got **InfoScout** structured in a clean, modular way. From the tree and code, here’s how the repo description and README could be shaped so anyone landing on your GitHub instantly “gets it” without having to dig through files:
-
----
-
 # 📖 InfoScout
 
 **InfoScout** is an **Agentic AI web scout** that autonomously searches Google (and falls back to DuckDuckGo when needed), extracts the **top 10 results**, and returns them as structured, clickable links. It uses **Playwright** for robust browser automation, with HTTP + BeautifulSoup + regex fallback to stay resilient against SERP changes.
