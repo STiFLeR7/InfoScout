@@ -1,0 +1,26 @@
+# requirements.txt
+# Dependencies for AI Web Agent with Mistral 7B OpenOrca
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+playwright==1.40.0
+requests==2.31.0
+llama-cpp-python>=0.1.58
+# Note: sqlite3 and asyncio are built into Python
+
+# GUI dependencies  
+streamlit==1.28.0
+pandas==2.1.1
+plotly==5.17.0
+uvivcorn
+fastapi
+beautifulsoup4
+pytesseract
+
+# Optional: For voice input (future enhancement)
+# speechrecognition==3.10.0
+# pyaudio==0.2.11
+
+# Development dependencies (uncomment if needed)
+# pytest==7.4.0
+# black==23.9.1

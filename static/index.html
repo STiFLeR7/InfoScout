@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Web Agent (FastAPI)</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="title-row">
+      <div class="logo">🤖</div>
+      <div>
+        <h1>AI Web Agent <small class="muted">(FastAPI)</small></h1>
+        <p class="sub">Control & interact with the autonomous browsing + local LLM agent</p>
+      </div>
+    </div>
+    <div class="status-row">
+      <div id="modelStatus" class="status-badge status-warn">Checking model...</div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card controls-card">
+      <div class="controls-grid">
+        <div class="btn-row">
+          <button id="startBtn" class="btn btn-primary">▶ Start Agent</button>
+          <button id="stopBtn" class="btn btn-danger" disabled>⏹ Stop Agent</button>
+          <label class="inline">
+            <input id="headlessToggle" type="checkbox" checked> Headless
+          </label>
+        </div>
+
+        <div class="model-row">
+          <input id="modelPath" placeholder="Optional local model path (e.g. D:/YASH/model/xxx.gguf)" />
+          <button id="loadModelBtn" class="btn">Load Model</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card input-card">
+      <label class="section-title">Send Instruction</label>
+      <textarea id="instruction" placeholder="e.g. search for laptops"></textarea>
+      <div class="input-actions">
+        <button id="micBtn" class="btn btn-ghost" title="Start speech-to-text">🎤 STT</button>
+        <button id="executeBtn" class="btn btn-accent">🚀 Execute</button>
+      </div>
+    </section>
+
+    <section class="card results-card">
+      <div class="section-header">
+        <label class="section-title">Results</label>
+        <div class="download-group">
+          <button id="downloadJSON" class="btn btn-ghost">⬇ JSON</button>
+          <button id="downloadCSV" class="btn btn-ghost">⬇ CSV</button>
+        </div>
+      </div>
+      <div id="resultsArea" class="results-area">
+        <div id="resultsBox" class="results-placeholder">No results yet.</div>
+      </div>
+    </section>
+
+    <section class="card recent-card">
+      <div class="section-header">
+        <label class="section-title">Recent History</label>
+        <div>
+          <button id="refreshTasks" class="btn btn-ghost">🔄 Refresh</button>
+        </div>
+      </div>
+      <ul id="recentBox" class="recent-list"><li>No recent tasks.</li></ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <small>Powered by FastAPI + Playwright + local LLM</small>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
